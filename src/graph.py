@@ -1,37 +1,89 @@
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from src.state import GraphState
+from src.agents.generation import generation_agent_node
 
-async def query_router_node(state: GraphState) -> GraphState:
-    return {"optimized_query": f"Optimized: {state['original_query']}", "execution_logs": state.get("execution_logs", []) + ["Query routed."]}
+# ---------------------------------------------------------------------------
+# Fallback Circuit Breaker Node
+# ---------------------------------------------------------------------------
+async def fallback_node(state: GraphState) -> GraphState:
+    """
+    Terminates execution when max retries are reached to avoid infinite loops & excessive costs.
+    """
+    logs = state.get("execution_logs", [])
+    logs.append("Circuit Breaker Activated: Maximum retry threshold reached.")
+    
+    return {
+        "fallback_mode": True,
+        "generated_response": "Unable to locate sufficient relevant context in the database to answer this request accurately.",
+        "execution_logs": logs
+    }
 
-async def retrieval_node(state: GraphState) -> GraphState:
-    return {"retrieved_documents": [], "execution_logs": state.get("execution_logs", []) + ["Retrieval completed."]}
+# ---------------------------------------------------------------------------
+# Conditional Edge Router Functions
+# ---------------------------------------------------------------------------
+def decide_after_doc_grader(state: GraphState) -> Literal["generate", "rewrite", "fallback"]:
+    """
+    Evaluates context relevance. Routes to generation if context is valid, 
+    otherwise triggers query re-writing or web search fallback if max retries exceeded.
+    """
+    is_relevant = state.get("is_context_relevant", False)
+    retries = state.get("retry_count", 0)
+    
+    if is_relevant:
+        return "generate"
+    elif retries >= 3:
+        return "fallback"
+    else:
+        return "rewrite"
 
-async def doc_grader_node(state: GraphState) -> GraphState:
-    return {"is_context_relevant": True, "execution_logs": state.get("execution_logs", []) + ["Context graded."]}
 
-async def generation_node(state: GraphState) -> GraphState:
-    return {"generated_response": "Response.", "execution_logs": state.get("execution_logs", []) + ["Response generated."]}
+def decide_after_hallucination_grader(state: GraphState) -> Literal["end", "generate", "fallback"]:
+    """
+    Evaluates response groundedness. Ends graph if hallucination-free, 
+    otherwise triggers re-generation or fallback if loop limit hit.
+    """
+    is_grounded = state.get("is_hallucination_free", False)
+    retries = state.get("retry_count", 0)
+    
+    if is_grounded:
+        return "end"
+    elif retries >= 3:
+        return "fallback"
+    else:
+        return "generate"
 
-async def hallucination_grader_node(state: GraphState) -> GraphState:
-    return {"is_hallucination_free": True, "execution_logs": state.get("execution_logs", []) + ["Hallucination check passed."]}
-
-def decide_to_generate(state: GraphState) -> Literal["generate", "end"]:
-    return "generate" if state.get("is_context_relevant") else "end"
-
+# ---------------------------------------------------------------------------
+# StateGraph Assembly
+# ---------------------------------------------------------------------------
 builder = StateGraph(GraphState)
-builder.add_node("query_router", query_router_node)
-builder.add_node("retrieval", retrieval_node)
-builder.add_node("doc_grader", doc_grader_node)
-builder.add_node("generation", generation_node)
-builder.add_node("hallucination_grader", hallucination_grader_node)
 
-builder.set_entry_point("query_router")
-builder.add_edge("query_router", "retrieval")
-builder.add_edge("retrieval", "doc_grader")
-builder.add_conditional_edges("doc_grader", decide_to_generate, {"generate": "generation", "end": END})
-builder.add_edge("generation", "hallucination_grader")
-builder.add_edge("hallucination_grader", END)
+# Add Generation & Fallback Nodes
+builder.add_node("generation", generation_agent_node)
+builder.add_node("fallback", fallback_node)
 
+# Conditional Edges for Self-Correction Loops
+builder.add_conditional_edges(
+    "doc_grader",
+    decide_after_doc_grader,
+    {
+        "generate": "generation",
+        "rewrite": "query_rewriter",
+        "fallback": "fallback"
+    }
+)
+
+builder.add_conditional_edges(
+    "hallucination_grader",
+    decide_after_hallucination_grader,
+    {
+        "end": END,
+        "generate": "generation",
+        "fallback": "fallback"
+    }
+)
+
+builder.add_edge("fallback", END)
+
+# Compile Graph
 app = builder.compile()
