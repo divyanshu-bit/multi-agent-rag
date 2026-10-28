@@ -3,7 +3,7 @@ version: '3.8'
 services:
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: qdrant_rag
+    container_name: rag_qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -11,8 +11,8 @@ services:
       - qdrant_storage:/qdrant/storage
 
   redis:
-    image: redis:alpine
-    container_name: redis_rag
+    image: redis:7-alpine
+    container_name: rag_redis
     ports:
       - "6379:6379"
 
